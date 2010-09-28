@@ -13,6 +13,9 @@ def _canonicalize_hostport(host, port):
         return host, port
     else:
         raise ValueError('Invalid host, port pair: %r', (host, port))
+
+class ClientDisabledError(Error):
+    pass
         
 class SimpleClient():
     def __init__(self, protocol, host, port, frame=False, log_filename=None, timeout=None):
@@ -56,6 +59,8 @@ class SimpleClient():
     
     def __getattr__(self, k):
         def f(*args, **kwargs):
+            if not self.is_enabled():
+                raise ClientDisabledError()
             if self.file:
                 client_file = self._connect_file()
             try:
@@ -64,22 +69,26 @@ class SimpleClient():
                 pass # Errors are throw after writing, simply ignore them
             
             client = self._connect()
+            ret = getattr(client, k)(*args, **kwargs)
+            self.socket.close()
+            return ret
             
-                
         return f
         
+    def __str__(self):
+        return '<%s client %s:%d>' % (self.protocol.__name__, self.host, self.port)
+        
 class ReplicatedClient():
-    def __init__(self, protocol, frame=False, log_filename=None, timeout=None):
+    def __init__(self, protocol, frame=False, timeout=None):
         self.protocol = protocol
         self.frame = frame
-        self.log_filename = log_filename
         self.timeout = None
 
         self.servers = []
         
     def add_server(self, host=None, port=None, server=None):
         if not server:
-            server = SimpleClient(self.protocol, host, port, self.frame, self.log_filename, self.timeout)
+            server = SimpleClient(self.protocol, host, port, self.frame, None, self.timeout)
         self.servers.append(server)
         return self
         
@@ -91,8 +100,45 @@ class ReplicatedClient():
             self.servers = [s for s in self.servers if (host, port) != (s.host, s.port)]
         return self
         
+    def __getattr__(self, k):
+        def f(*args, **kwargs):
+            responses = []
+            for server in self.servers:
+                try:
+                    response = getattr(server, k)(*args, **kwargs)
+                except Exception e:
+                    response = e
+                responses.append((server, response))
+            return responses
+        return f
+        
+    def __str__(self):
+        return '<replicated %r>' % self.servers
+        
 class ThreadedReplicatedClient(ReplicatedClient):
-    
+    def __getattr__(self, k):
+        def f(*args, **kwargs):
+            response_for = {}
+            def get_response(server):
+                try:
+                    response = getattr(server, k)(*args, **kwargs)
+                except Exception, e:
+                    response = e
+                response_for[server] = response
+                
+            threads = []
+            for server in servers:
+                threads.append(threading.Thread(target=get_response, args=(server,)))
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            return response_for.items()
+            
+        return f
+
+    def __str__(self):
+        return '<threaded replicated %r>' % self.servers
 
 class HashClient():
     def __init__(self, protocol, frame=False, log_filename=None, timeout=None):
@@ -103,21 +149,50 @@ class HashClient():
         self.timeout = timeout
         
         self.all = ReplicatedClient(protocol, frame, log_filename)
+        self.hashfns = {}
 
-    def add_server(self, host, port=None):
-        server = SimpleClient(self.protocol, host, port, self.frame, self.log_filename, timeout)
+    def add_server(self, host=None, port=None, server=None):
+        if not server:
+            server = SimpleClient(self.protocol, host, port, self.frame, self.log_filename, timeout)
         self.servers.append(server)
         self.all.add_server(server=server)
         return self
 
     def remove_server(self, server=None, host=None, port=None):
-        pass
+        ReplicatedClient.remove_server(self, server, host, port)
+        self.all.remove_server(server, host, port)
         return self
+    
+    def set_hash(self, fnname, hashfn):
+        self.hashfuncs[fnname] = hashfn
+        return self
+        
+    def __getattr__(self, k):
+        def f(*args, **kwargs):
+            if k in self.hashfns:
+                hashval = self.hashfns[k](*args, **kwargs)
+            else:
+                hashkey = tuple(args + sorted(kwargs.items()))
+            hashval = hash(hashkey)
+            server_index = hashval % len(self.servers)
+            server = self.servers[server_index]
+            try:
+                return getattr(server, k)(*args, **kwargs)
+            except Exception, e:
+                e.server = server
+                raise e
+        return f
+        
+    def __str__(self):
+        return '<hash client %r>' % self.servers
     
 class ThreadedHashClient(HashClient):
     def __init__(self, protocol, frame=False, log_filename=None, timeout=None):
         HashClient.__init__(self, protocol, frame, log_filename, timeout)
         self.all = ThreadedReplicatedClient(protocol, frame, log_filename, timeout)
+        
+    def __str__(self):
+        return '<threaded hash client %r>' % self.servers
     
 """
 Usage notes:
