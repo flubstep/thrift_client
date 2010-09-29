@@ -1,13 +1,12 @@
 #!/usr/bin/env python
 
+import socket
 import logging
 import threading
 
 from thrift.transport import TTransport
 from thrift.transport import TSocket
 from thrift.protocol import TBinaryProtocol, TProtocol
-
-import socket
 
 _DEFAULT_TIMEOUT = 60001
 
@@ -99,7 +98,7 @@ class SimpleClient():
             try:
                 getattr(client_file, k)(*args, **kwargs)
             except:
-                pass # Errors are throw after writing, simply ignore them
+                pass # Errors are throwm after writing, simply ignore them.
             
             client = self._connect()
             ret = getattr(client, k)(*args, **kwargs)
@@ -119,6 +118,10 @@ class SimpleClient():
 
     def __hash__(self):
         return hash((self.host, self.port, self.protocol))
+
+    def __eq__(self, rhs):
+        return (isinstance(rhs, SimpleClient) and
+                (self.host, self.port, self.protocol) == (rhs.host, rhs.port, rhs.protocol))
         
 class ReplicatedClient():
     def __init__(self, protocol, frame=False, timeout=None):
@@ -164,15 +167,13 @@ class ThreadedReplicatedClient(ReplicatedClient):
     def __getattr__(self, k):
         def f(*args, **kwargs):
             responses = []
-            lock = threading.RLock()
             def get_response(server):
                 try:
                     response = ThriftResponse(server, getattr(server, k)(*args, **kwargs))
                 except Exception, e:
                     response = ThriftExceptionResponse(server, e)
-                lock.acquire()
+                # list.append() is thread-safe
                 responses.append(response)
-                lock.release()
                 
             threads = []
             for server in self.servers:
@@ -206,18 +207,22 @@ class HashClient():
         return self
 
     def remove_server(self, server=None, host=None, port=None):
-        ReplicatedClient.remove_server(self, server, host, port)
+        if server:
+            self.servers.remove(server)
+        else:
+            host, port = _canonicalize_hostport(host, port)
+            self.servers = [s for s in self.servers if (host, port) != (s.host, s.port)]
         self.all.remove_server(server, host, port)
         return self
     
     def set_hash(self, fnname, hashfn):
-        self.hashfuncs[fnname] = hashfn
+        self.hashfns[fnname] = hashfn
         return self
         
     def __getattr__(self, k):
         def f(*args, **kwargs):
             if k in self.hashfns:
-                hashval = self.hashfns[k](*args, **kwargs)
+                hashkey = self.hashfns[k](*args, **kwargs)
             else:
                 hashkey = args + tuple(sorted(kwargs.items()))
             hashval = hash(hashkey)
@@ -228,6 +233,7 @@ class HashClient():
             except Exception, e:
                 e.server = server
                 raise e
+        f.set_hash = lambda fn: self.set_hash(k, fn)
         return f
         
     def __str__(self):
@@ -243,40 +249,3 @@ class ThreadedHashClient(HashClient):
         
     def __str__(self):
         return '<threaded hash client %r>' % self.servers
-    
-"""
-Usage notes:
-
-typ_pool = ThreadedHashMultiClient(typersearch_if)
-
->>> typ_pool.servers
-[]
->>> typ_pool.add_server(host='localhost:6233')
->>> typ_pool.add_server(host='localhost:6234')
->>> typ_pool.servers
-[typersearch_if(localhost:6233), typersearch_if(localhost:6234)]
-
-
-try:
-    typ_pool.search('term')
-except Exception, e:
-    log.error('Server %r raised an exception during search()' % e.server)
-    raise e
-
-def error_handler(server, e):
-    server.disable()
-    log.error('Received exception from %r: %r' % (server, e))
-
-# Processing return values from a multi-server Thrift call.
-for server, response in typ_pool.all.ping():
-    if response != 'pong':
-        log.error('Received invalid pong from server: %r' % server)
-        typ_pool.remove_server(server)
-
-# Sending a call to all Thrift servers.
-typ_pool.all.add_document(document)
-
-# Processing errors 
-typ_pool.all.ping.set_error_handler(error_handler)
-
-"""
