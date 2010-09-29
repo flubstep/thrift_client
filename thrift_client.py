@@ -1,6 +1,13 @@
 #!/usr/bin/env python
 
 import logging
+import threading
+
+from thrift.transport import TTransport
+from thrift.transport import TSocket
+from thrift.protocol import TBinaryProtocol, TProtocol
+
+import socket
 
 _DEFAULT_TIMEOUT = 60001
 
@@ -14,11 +21,37 @@ def _canonicalize_hostport(host, port):
     else:
         raise ValueError('Invalid host, port pair: %r', (host, port))
 
-class ClientDisabledError(Error):
+class ClientDisabledError(Exception):
     pass
+
+class ThriftResponse():
+    def __init__(self, server, response):
+        self.server = server
+        self.response = response
+
+    def value(self):
+        return self.response
+
+    def __str__(self):
+        return '<thrift response: %r>' % self.response
+
+    def __repr__(self):
+        return str(self)
+
+class ThriftExceptionResponse():
+    def __init__(self, server, exception):
+        self.server = server
+        self.exception = exception
+
+    def value(self):
+        self.exception.server = self.server
+        raise self.exception
+
+    def __str__(self):
+        return '<thrift exception object>'
         
 class SimpleClient():
-    def __init__(self, protocol, host, port, frame=False, log_filename=None, timeout=None):
+    def __init__(self, protocol, host, port=None, frame=False, log_filename=None, timeout=None):
         self.protocol = protocol
         self.host, self.port = _canonicalize_hostport(host, port)
         self.frame = frame
@@ -77,6 +110,15 @@ class SimpleClient():
         
     def __str__(self):
         return '<%s client %s:%d>' % (self.protocol.__name__, self.host, self.port)
+
+    def __repr__(self):
+        return str(self)
+
+    def __nonzero__(self):
+        return True
+
+    def __hash__(self):
+        return hash((self.host, self.port, self.protocol))
         
 class ReplicatedClient():
     def __init__(self, protocol, frame=False, timeout=None):
@@ -105,35 +147,41 @@ class ReplicatedClient():
             responses = []
             for server in self.servers:
                 try:
-                    response = getattr(server, k)(*args, **kwargs)
-                except Exception e:
-                    response = e
-                responses.append((server, response))
+                    response = ThriftResponse(server, getattr(server, k)(*args, **kwargs))
+                except Exception, e:
+                    response = ThriftExceptionResponse(server, e)
+                responses.append(response)
             return responses
         return f
         
     def __str__(self):
         return '<replicated %r>' % self.servers
+
+    def __repr__(self):
+        return str(self)
         
 class ThreadedReplicatedClient(ReplicatedClient):
     def __getattr__(self, k):
         def f(*args, **kwargs):
-            response_for = {}
+            responses = []
+            lock = threading.RLock()
             def get_response(server):
                 try:
-                    response = getattr(server, k)(*args, **kwargs)
+                    response = ThriftResponse(server, getattr(server, k)(*args, **kwargs))
                 except Exception, e:
-                    response = e
-                response_for[server] = response
+                    response = ThriftExceptionResponse(server, e)
+                lock.acquire()
+                responses.append(response)
+                lock.release()
                 
             threads = []
-            for server in servers:
+            for server in self.servers:
                 threads.append(threading.Thread(target=get_response, args=(server,)))
             for thread in threads:
                 thread.start()
             for thread in threads:
                 thread.join()
-            return response_for.items()
+            return responses
             
         return f
 
@@ -141,19 +189,18 @@ class ThreadedReplicatedClient(ReplicatedClient):
         return '<threaded replicated %r>' % self.servers
 
 class HashClient():
-    def __init__(self, protocol, frame=False, log_filename=None, timeout=None):
+    def __init__(self, protocol, frame=False, timeout=None):
         self.servers = []
         self.protocol = protocol
         self.frame = frame
-        self.log_filename = log_filename
         self.timeout = timeout
         
-        self.all = ReplicatedClient(protocol, frame, log_filename)
+        self.all = ReplicatedClient(protocol, frame, timeout)
         self.hashfns = {}
 
     def add_server(self, host=None, port=None, server=None):
         if not server:
-            server = SimpleClient(self.protocol, host, port, self.frame, self.log_filename, timeout)
+            server = SimpleClient(self.protocol, host, port, self.frame, None, self.timeout)
         self.servers.append(server)
         self.all.add_server(server=server)
         return self
@@ -172,7 +219,7 @@ class HashClient():
             if k in self.hashfns:
                 hashval = self.hashfns[k](*args, **kwargs)
             else:
-                hashkey = tuple(args + sorted(kwargs.items()))
+                hashkey = args + tuple(sorted(kwargs.items()))
             hashval = hash(hashkey)
             server_index = hashval % len(self.servers)
             server = self.servers[server_index]
@@ -185,11 +232,14 @@ class HashClient():
         
     def __str__(self):
         return '<hash client %r>' % self.servers
+
+    def __repr__(self):
+        return str(self)
     
 class ThreadedHashClient(HashClient):
-    def __init__(self, protocol, frame=False, log_filename=None, timeout=None):
-        HashClient.__init__(self, protocol, frame, log_filename, timeout)
-        self.all = ThreadedReplicatedClient(protocol, frame, log_filename, timeout)
+    def __init__(self, protocol, frame=False, timeout=None):
+        HashClient.__init__(self, protocol, frame, timeout)
+        self.all = ThreadedReplicatedClient(protocol, frame, timeout)
         
     def __str__(self):
         return '<threaded hash client %r>' % self.servers
