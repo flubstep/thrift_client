@@ -1,8 +1,9 @@
 __doc__ = """Classes for common use cases of Thrift clients."""
 __author__ = """Albert Sheu"""
 
-import socket
 import logging
+import random
+import socket
 import threading
 
 from thrift.transport import TTransport
@@ -39,7 +40,7 @@ class ThriftResponse():
     def value(self):
         """Returns the value returned by the Thrift server."""
         return self.response
-        
+
     def is_error(self):
         """Returns whether an exception was raised by the RPC."""
         return False
@@ -63,43 +64,44 @@ class ThriftExceptionResponse(ThriftResponse):
         """Does not return, instead raises the exception raised by the server."""
         self.exception.server = self.server
         raise self.exception
-        
+
     def is_error(self):
         """Returns whether an exception was raised by the RPC."""
         return True
 
     def __str__(self):
         return '<thrift exception object>'
-        
-class SimpleClient():
+
+class SimpleClient(threading.local):
     """Returns a new instance of the SimpleClient class. Represents a connection
     to a single Thrift server of the given protocol. host and port represent the
     location of the Thrift service. frame indicates whether the service is
     running under a TFramedTransport. timeout indicates the socket timeout
     factor on the socket connect(), send(), and recv()."""
-    def __init__(self, protocol, host, port=None, frame=False, log_filename=None, timeout=None):
+    def __init__(self, protocol, host, port=None, frame=False, log_filename=None, timeout=None, name=None):
         self.protocol = protocol
         self.host, self.port = _canonicalize_hostport(host, port)
         self.frame = frame
         self.timeout = timeout or _DEFAULT_TIMEOUT
         self.file = None
         self.enabled = True
+        self.name = name or '%s-%d' % (self.protocol.__name__, id(self))
         if log_filename:
             self.file = open(log_filename, 'ab')
-        
+
     def enable(self):
         """Allows function calls to be made through the Thrift client."""
         self.enabled = True
-        
+
     def disable(self):
         """Causes client to raise a ClientDisabledError when attempting to
         call a remote function using this client."""
         self.enabled = False
-        
+
     def is_enabled(self):
         """Returns whether the client has been enabled or not."""
         return self.enabled
-        
+
     def _connect(self):
         """Initializes the socket, transport, protocol, and session for
         the Thrift service."""
@@ -112,7 +114,7 @@ class SimpleClient():
         client = self.protocol.Client(protocol)
         transport.open()
         return client
-        
+
     def _connect_file(self):
         """Initializes the transport of the Thrift service to write to a
         logfile instead of a socket transport."""
@@ -123,7 +125,7 @@ class SimpleClient():
         client = self.protocol.Client(iprot=TProtocol.TProtocolBase(transport), oprot=protocol)
         transport.open()
         return client
-    
+
     def __getattr__(self, k):
         """Proxy function for executing Thrift calls. Client will initialize
         the connection to the remote host or file, execute the command, and
@@ -139,14 +141,14 @@ class SimpleClient():
                 getattr(client_file, k)(*args, **kwargs)
             except:
                 pass # Errors are throwm after writing, simply ignore them.
-            
+
             client = self._connect()
             ret = getattr(client, k)(*args, **kwargs)
             self.socket.close()
             return ret
-            
+
         return f
-        
+
     def __str__(self):
         return '<%s client %s:%d>' % (self.protocol.__name__, self.host, self.port)
 
@@ -170,30 +172,62 @@ class MultiClient():
         self.frame = frame
         self.timeout = None
         self.servers = []
-        
-    def add_server(self, host=None, port=None, server=None):
+        self.server_dict = {}
+
+    def random_server(self):
+        if not self.servers:
+            return None
+        return random.choice(self.servers)
+
+    def get_server(self, name=None, host=None, port=None):
+        if name:
+            if name in self.server_dict:
+                return self.server_dict[name]
+            else:
+                raise KeyError('No server named: %r' % name)
+        elif host and port:
+            host, port = _canonicalize_hostport(host, port)
+            for server in self.servers:
+                if (server.host, server.port) == (host, port):
+                    return server
+            else:
+                raise KeyError('No server named: %r' % name)
+        else:
+            raise KeyError('No server identifier given.')
+
+    def add_server(self, host=None, port=None, server=None, name=None):
         """Adds a server to the client pool. If server is not defined, then a new one
         with the given host and port is created as a SimpleClient. Returns the server
         that was just added."""
         if not server:
-            server = SimpleClient(self.protocol, host, port, self.frame, None, self.timeout)
+            server = SimpleClient(self.protocol, host, port, self.frame, None, self.timeout, name)
         self.servers.append(server)
+        if name in self.server_dict:
+            raise ValueError('Duplicate server name in server pool.')
+        self.server_dict[server.name] = server
         return server
 
-    def remove_server(self, server=None, host=None, port=None):
+    def remove_server(self, server=None, name=None, host=None, port=None):
         """Removes the server from the pool, or removes the server with the indicated
         host and port from the pool."""
         if server:
             self.servers.remove(server)
+            del self.server_dict[server.name]
+        elif name:
+            server = self.get_server(name=name)
+            self.remove_server(server=server)
         else:
             host, port = _canonicalize_hostport(host, port)
-            self.servers = [s for s in self.servers if (host, port) != (s.host, s.port)]
-        
+            to_remove = [s for s in self.servers if (host, port) == (s.host, s.port)]
+            for server in to_remove:
+                self.servers.remove(server)
+                del self.server_dict[server.name]
+
 class ReplicatedClient(MultiClient):
     """Returns a new instance of the ReplicatedClient class. The ReplicatedClient represents
     a pool of servers all of whom expect to get every Thrift call called on the client. To
     add servers to the pool, call add_server(host, port) on the ReplicatedClient."""
-        
+
     def __getattr__(self, k):
         """Proxies the request for the function with name 'k' to all of the servers added
         to the pool. The return result is a list of ThriftResponse objects, which contain
@@ -210,13 +244,13 @@ class ReplicatedClient(MultiClient):
                 responses.append(response)
             return responses
         return f
-        
+
     def __str__(self):
         return '<replicated %r>' % self.servers
 
     def __repr__(self):
         return str(self)
-        
+
 class ThreadedReplicatedClient(ReplicatedClient):
     """Returns a new instance of the ThreadedReplicatedClient class. A
     ThreadedReplicatedClient is identical to a ReplicatedClient, except that function calls
@@ -231,7 +265,7 @@ class ThreadedReplicatedClient(ReplicatedClient):
                     response = ThriftExceptionResponse(server, e)
                 # list.append() is thread-safe
                 responses.append(response)
-                
+
             threads = []
             for server in self.servers:
                 threads.append(threading.Thread(target=get_response, args=(server,)))
@@ -240,7 +274,7 @@ class ThreadedReplicatedClient(ReplicatedClient):
             for thread in threads:
                 thread.join()
             return responses
-            
+
         return f
 
     def __str__(self):
@@ -251,18 +285,14 @@ class HashClient(MultiClient):
     servers. When a Thrift call comes in, its parameters are hashed, and one of the given
     servers is used to respond to the Thrift request."""
     def __init__(self, protocol, frame=False, timeout=None):
-        self.servers = []
-        self.protocol = protocol
-        self.frame = frame
-        self.timeout = timeout
-        
+        MultiClient.__init__(self, protocol, frame, timeout)
         self.all = ReplicatedClient(protocol, frame, timeout)
         self.hashfns = {}
 
     def add_server(self, host=None, port=None, server=None):
         """Adds a server to the client pool. If server is not defined, then a new one
         with the given host and port is created as a SimpleClient. Returns the server
-        that was just added."""        
+        that was just added."""
         server = MultiClient.add_server(self, host, port, server)
         self.all.add_server(server=server)
         return server
@@ -272,14 +302,14 @@ class HashClient(MultiClient):
         host and port from the pool."""
         MultiClient.remove_server(self, server, host, port)
         self.all.remove_server(server, host, port)
-    
+
     def set_hash(self, fnname, hashfn):
         """Changes the default hash function for the function named 'fnname' to hashfn.
         hashfn() expects the same parameters that the function defined as 'fnname'
         expects."""
         self.hashfns[fnname] = hashfn
         return self
-        
+
     def __getattr__(self, k):
         """Proxy function for executing Thrift calls. When a call is made, the parameters
         of the function call are hashed, and a corresponding server is chosen to serve
@@ -296,19 +326,22 @@ class HashClient(MultiClient):
             server_index = hashval % len(self.servers)
             server = self.servers[server_index]
             try:
-                return getattr(server, k)(*args, **kwargs)
+                ret = getattr(server, k)(*args, **kwargs)
+                response = ThriftResponse(server, ret)
             except Exception, e:
                 e.server = server
-                raise e
+                response = ThriftExceptionResponse(server, e)
+            return response
+
         f.set_hash = lambda fn: self.set_hash(k, fn)
         return f
-        
+
     def __str__(self):
         return '<hash client %r>' % self.servers
 
     def __repr__(self):
         return str(self)
-    
+
 class ThreadedHashClient(HashClient):
     """Returns a new instance of the ThreadedHashClient class. A ThreadedHashClient is
     identical to a HashClient, except that operations executed on 'all' are done in a
@@ -316,6 +349,6 @@ class ThreadedHashClient(HashClient):
     def __init__(self, protocol, frame=False, timeout=None):
         HashClient.__init__(self, protocol, frame, timeout)
         self.all = ThreadedReplicatedClient(protocol, frame, timeout)
-        
+
     def __str__(self):
         return '<threaded hash client %r>' % self.servers
