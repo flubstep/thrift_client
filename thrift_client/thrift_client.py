@@ -17,13 +17,19 @@ def _canonicalize_hostport(host, port):
     string of the host, and int of the port. Valid host, port arguments
     are returned. Idempotent function."""
     if port is not None:
+        host = socket.gethostbyname(host)
         return host, port
     elif port is None and ':' in host:
         host, port = host.split(':')
+        host = socket.gethostbyname(host)
         port = int(port)
         return host, port
     else:
         raise ValueError('Invalid host, port pair: %r', (host, port))
+
+class InvalidServerName(Exception):
+    """Raised when a call is attempted to a server that's not known."""
+    pass
 
 class ClientDisabledError(Exception):
     """Raised when a function call is attempted on a disabled client."""
@@ -170,7 +176,7 @@ class MultiClient():
     def __init__(self, protocol, frame=False, timeout=None):
         self.protocol = protocol
         self.frame = frame
-        self.timeout = None
+        self.timeout = timeout
         self.servers = []
         self.server_dict = {}
 
@@ -184,16 +190,16 @@ class MultiClient():
             if name in self.server_dict:
                 return self.server_dict[name]
             else:
-                raise KeyError('No server named: %r' % name)
+                raise InvalidServerName('No server named: %r' % name)
         elif host and port:
             host, port = _canonicalize_hostport(host, port)
             for server in self.servers:
                 if (server.host, server.port) == (host, port):
                     return server
             else:
-                raise KeyError('No server named: %r' % name)
+                raise InvalidServerName('No server named: %r' % name)
         else:
-            raise KeyError('No server identifier given.')
+            raise InvalidServerName('No server identifier given.')
 
     def add_server(self, host=None, port=None, server=None, name=None):
         """Adds a server to the client pool. If server is not defined, then a new one
