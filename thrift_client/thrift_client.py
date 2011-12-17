@@ -181,11 +181,13 @@ class MultiClient():
         self.server_dict = {}
 
     def random_server(self):
+        """Returns a random server from the pool."""
         if not self.servers:
             return None
         return random.choice(self.servers)
 
     def get_server(self, name=None, host=None, port=None):
+        """Returns a server by name or by host/port combination from the pool."""
         if name:
             if name in self.server_dict:
                 return self.server_dict[name]
